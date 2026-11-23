@@ -1,0 +1,140 @@
+name: Build Android APK (Calcu-Flow)
+
+# কখন চলবে: main-এ push করলে, ম্যানুয়ালি (Actions → Run workflow), অথবা v* ট্যাগ দিলে
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      VERSION_CODE: ${{ github.run_number }}
+      VERSION_NAME: 1.0.${{ github.run_number }}
+
+    steps:
+      - name: কোড নামানো
+        uses: actions/checkout@v4
+
+      - name: ZIP থেকে ফাইল খোলা (শুধু ZIP আপলোড করলে এটি কাজ করে)
+        run: |
+          if [ ! -f package.json ]; then
+            Z=$(ls *.zip 2>/dev/null | head -n 1)
+            test -n "$Z" || { echo "রিপোজিটরিতে ZIP বা package.json কিছুই নেই"; exit 1; }
+            rm -rf _unz && mkdir _unz && unzip -q -o "$Z" -d _unz
+            D=$(dirname "$(find _unz -name package.json -not -path '*/node_modules/*' | head -n 1)")
+            cp -a "$D"/. .
+            rm -rf _unz
+            ls -la
+          fi
+
+      - name: Node.js ২২
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Java ২১
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      - name: Gradle ক্যাশ
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('package.json', 'scripts/patch-android.mjs') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: www ফাইল যাচাই
+        run: node scripts/check-www.mjs
+
+      - name: npm প্যাকেজ ইনস্টল
+        run: npm install --legacy-peer-deps --no-audit --no-fund
+
+      - name: Android প্রজেক্ট তৈরি (Capacitor)
+        run: npx cap add android
+
+      - name: সাইনিং কী (সিক্রেট থাকলে সেটা, নইলে রিপোর কী)
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KS_KEYPASS: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            echo "JN_KEYSTORE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+            echo "JN_STORE_PASS=$KS_PASS" >> "$GITHUB_ENV"
+            echo "JN_KEY_ALIAS=${KS_ALIAS:-jonaki}" >> "$GITHUB_ENV"
+            echo "JN_KEY_PASS=${KS_KEYPASS:-$KS_PASS}" >> "$GITHUB_ENV"
+            echo "নিজের সিক্রেট কী ব্যবহার হচ্ছে"
+          else
+            echo "রিপোজিটরির keystore/jonaki-release.jks ব্যবহার হচ্ছে"
+          fi
+
+      - name: জাভা কম্পাইল ত্রুটি ঠিক করা (JSONException)
+        run: |
+          python3 - <<'PY'
+          import re
+          f = "android-overlay/java/JonakiNativePlugin.java"
+          s = open(f, encoding="utf-8").read()
+          old = "            } catch (Throwable t) {\n                cs.put(0.9d);\n            }"
+          new = "            } catch (Throwable t) {\n                try { cs.put(0.9d); } catch (Throwable ignored) { }\n            }"
+          assert old in s, "প্যাচের লাইন পাওয়া যায়নি"
+          open(f, "w", encoding="utf-8").write(s.replace(old, new, 1))
+          print("প্যাচ প্রয়োগ হয়েছে")
+          PY
+
+      - name: নেটিভ কোড, পারমিশন, আইকন বসানো
+        run: node scripts/patch-android.mjs
+
+      - name: ওয়েব ফাইল সিঙ্ক
+        run: npx cap sync android
+
+      - name: APK বিল্ড (release, সাইন করা)
+        working-directory: android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: APK এর নাম ঠিক করা
+        run: |
+          APK=$(find android/app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          test -n "$APK" || { echo "APK পাওয়া যায়নি"; exit 1; }
+          mkdir -p dist
+          cp "$APK" "dist/CalcuFlow-${VERSION_NAME}.apk"
+          ls -la dist
+
+      - name: APK আপলোড (Actions → Artifacts)
+        uses: actions/upload-artifact@v4
+        with:
+          name: CalcuFlow-APK
+          path: dist/*.apk
+          retention-days: 90
+
+      - name: GitHub Release তৈরি (Releases পেজ থেকে সরাসরি ডাউনলোড)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: ক্যালকু-ফ্লো ${{ env.VERSION_NAME }}
+          body: |
+            ক্যালকু-ফ্লো (জোনাকি) Android APK — বিল্ড #${{ github.run_number }}
+            নিচের `.apk` ফাইলটি ফোনে নামিয়ে ইনস্টল করুন।
+          files: dist/*.apk
